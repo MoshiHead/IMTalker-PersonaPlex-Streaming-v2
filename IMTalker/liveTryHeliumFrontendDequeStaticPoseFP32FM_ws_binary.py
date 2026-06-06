@@ -938,6 +938,12 @@ class LiveHeliumFMEngine:
         _sync_cuda()
         print(f"[liveTryHeliumFM][warmup] renderer={_ms(t0):.0f}ms", flush=True)
 
+        # Pre-render neutral reference frame for silence periods (face stays still)
+        neutral_motion = self.ref_x.to(dtype=self.dtype)
+        neutral_np, _ = self._render_motion(neutral_motion)
+        self.neutral_jpeg_bytes: bytes = encode_jpeg_bytes(neutral_np[0], self.jpeg_quality)
+        print(f"[liveTryHeliumFM][warmup] neutral_jpeg={len(self.neutral_jpeg_bytes)} bytes", flush=True)
+
         # Warmup JPEG pool
         t0 = time.perf_counter()
         dummy_np = np.zeros((512, 512, 3), dtype=np.uint8)
@@ -1292,6 +1298,35 @@ class LiveHeliumFMEngine:
             )
         return packets
 
+    def render_silence_subbatch(
+        self,
+        n_frames: int,
+        audio_slices: list,
+        abs_start: int,
+        avatar_chunk_id: int,
+        total_gen_ms: float,
+    ) -> list:
+        """Return packets using the pre-rendered neutral JPEG for silence periods."""
+        packets = []
+        gen_ms_i = int(round(float(total_gen_ms)))
+        sr_i = int(round(float(TARGET_SR)))
+        silence_samples = int(round(TARGET_SR / self.fps))
+        for j in range(n_frames):
+            idx = abs_start + j
+            audio_slice = audio_slices[j] if j < len(audio_slices) else np.zeros(silence_samples, dtype=np.float32)
+            pcm_b = _pcm_f32_to_i16_bytes(audio_slice)
+            blob = _wsbin.pack_av_frame(
+                idx, idx + 1, gen_ms_i, sr_i,
+                self.neutral_jpeg_bytes, pcm_b, "", int(avatar_chunk_id),
+            )
+            packets.append({
+                "frame_number": idx,
+                "ws_kind": "bytes",
+                "data": blob,
+                "t_ready": time.perf_counter(),
+            })
+        return packets
+
     def audio_slice(self, frame_idx: int) -> np.ndarray:
         if self.audio_pcm is None:
             frame_samples = int(round(TARGET_SR / self.fps))
@@ -1505,19 +1540,6 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--fp32", action="store_true")
         parser.add_argument("--tf32", action="store_true")
         parser.add_argument("--compile_renderer", action="store_true")
-        # VAD — voice activity detection
-        parser.add_argument(
-            "--vad_threshold", type=float, default=0.015,
-            help="Input audio RMS threshold for VAD (0.0–1.0). Below this = silence.",
-        )
-        parser.add_argument(
-            "--vad_holdoff_sec", type=float, default=0.5,
-            help="Seconds of sub-threshold input before VAD declares speech-end.",
-        )
-        parser.add_argument(
-            "--vad_onset_frames", type=int, default=2,
-            help="Consecutive above-threshold frames required to declare speech-onset.",
-        )
         return parser
 
 
@@ -1658,29 +1680,6 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 last_real_audio_wall = time.perf_counter()
                 was_silent = True
 
-                # ── VAD state ────────────────────────────────────────────────
-                # user_has_spoken: latches True on first confirmed speech;
-                #   gates ALL avatar frame generation so the avatar never speaks
-                #   before the user does.
-                # is_user_speaking: live VAD state with onset/offset hysteresis.
-                vad_threshold = float(getattr(args, "vad_threshold", 0.015))
-                vad_holdoff_sec = float(getattr(args, "vad_holdoff_sec", 0.5))
-                vad_onset_frames = max(1, int(getattr(args, "vad_onset_frames", 2)))
-                vad_silence_offset_frames = max(
-                    3, int(round(vad_holdoff_sec * float(args.fps)))
-                )
-                user_has_spoken: bool = False
-                is_user_speaking: bool = False
-                _consec_speech: int = 0
-                _consec_silence: int = 0
-                print(
-                    f"[GPU][VAD] threshold={vad_threshold:.4f} "
-                    f"onset={vad_onset_frames}f "
-                    f"holdoff={vad_holdoff_sec:.2f}s ({vad_silence_offset_frames}f)",
-                    flush=True,
-                )
-                # ─────────────────────────────────────────────────────────────
-
                 def _enqueue_frame(pkt: dict) -> None:
                     """Block until frame_q accepts pkt (real backpressure). Must run from GPU thread."""
                     fut = asyncio.run_coroutine_threadsafe(frame_q.put(pkt), event_loop)
@@ -1713,62 +1712,10 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         if raw_bytes:
                             pcm_f32 = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
                             rms = float(np.sqrt(np.mean(pcm_f32 ** 2))) if pcm_f32.size else 0.0
-
-                            # ── VAD onset/offset with hysteresis ────────────
-                            if rms > vad_threshold:
+                            if rms > 0.003:
                                 last_real_audio_wall = time.perf_counter()
-                                _consec_speech += 1
-                                _consec_silence = 0
-                                if _consec_speech >= vad_onset_frames:
-                                    if not is_user_speaking:
-                                        is_user_speaking = True
-                                        print(
-                                            f"[GPU][VAD] speech onset rms={rms:.4f}",
-                                            flush=True,
-                                        )
-                                    if not user_has_spoken:
-                                        user_has_spoken = True
-                                        # Clean slate when user first speaks:
-                                        # trim any stale Moshi input to at most
-                                        # one frame so we don't burst-process a
-                                        # multi-second backlog.
-                                        buf = reply_engine.input_buffer
-                                        if buf.shape[0] > MIMI_FRAME_SIZE:
-                                            reply_engine.input_buffer = (
-                                                buf[-MIMI_FRAME_SIZE:].copy()
-                                            )
-                                        # Reset FM streaming state so the first
-                                        # avatar chunk starts from a clean motion
-                                        # history, not one seeded by silence.
-                                        fm_engine.stream_state = None
-                                        fm_engine.abs_frame = 0
-                                        fm_engine.helium_deque = None
-                                        fm_engine.helium_deque_filled = 0
-                                        print(
-                                            "[GPU][VAD] first user speech — "
-                                            "FM state reset, ready to generate",
-                                            flush=True,
-                                        )
-                            else:
-                                _consec_speech = 0
-                                _consec_silence += 1
-                                if (
-                                    is_user_speaking
-                                    and _consec_silence >= vad_silence_offset_frames
-                                ):
-                                    is_user_speaking = False
-                                    print(
-                                        f"[GPU][VAD] speech offset "
-                                        f"(silent {_consec_silence} frames)",
-                                        flush=True,
-                                    )
-                            # ────────────────────────────────────────────────
-
                             no_audio_for = time.perf_counter() - last_real_audio_wall
-                            # Feed audio to Moshi when it is above threshold OR
-                            # within the 250ms holdoff window so Moshi sees
-                            # continuous audio without micro-gaps.
-                            if rms > vad_threshold or no_audio_for < 0.25:
+                            if rms > 0.003 or no_audio_for < 0.25:
                                 reply_engine.append_browser_pcm(
                                     np.frombuffer(raw_bytes, dtype=np.int16), input_sr
                                 )
@@ -1784,15 +1731,6 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     if not session_started.is_set():
                         time.sleep(0.003)
                         continue
-
-                    # ── VAD gate: don't generate avatar frames until the user
-                    # has actually spoken.  This prevents the avatar from
-                    # animating (or Moshi from "greeting" into silence) before
-                    # the user says anything. ──────────────────────────────────
-                    if not user_has_spoken:
-                        time.sleep(0.005)
-                        continue
-                    # ─────────────────────────────────────────────────────────
 
                     if reply_engine.input_buffer.shape[0] < MIMI_FRAME_SIZE:
                         q_depth = frame_q.qsize()
@@ -1846,62 +1784,26 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             pending_reply_audio = pending_reply_audio[hidden_steps_per_chunk:]
                             pending_reply_steps = pending_reply_steps[hidden_steps_per_chunk:]
 
-                            # ── is_speech: require BOTH a non-trivial output
-                            # token AND audible output RMS.  The old condition
-                            # used OR which triggered on any warmup token even
-                            # when output was pure silence, causing premature
-                            # avatar animation. ─────────────────────────────
                             is_speech = False
                             for s in used_steps:
                                 t = s.get("token", -1)
-                                out_rms = s.get("reply_rms", 0.0)
-                                if t not in (-1, 0, 3) and out_rms > 0.01:
+                                rms = s.get("reply_rms", 0.0)
+                                if (t not in (-1, 0, 3)) or rms > 0.005:
                                     is_speech = True
                                     break
-                            # ────────────────────────────────────────────────
 
                             if is_speech:
                                 if was_silent:
-                                    q_size_before_clear = frame_q.qsize()
-                                    print(
-                                        f"[GPU] silence→speech: clearing "
-                                        f"{q_size_before_clear} stale frames",
-                                        flush=True,
-                                    )
-                                    # ── Fix race condition: block the GPU
-                                    # thread until the event-loop coroutine
-                                    # has actually drained the queue, so we
-                                    # don't enqueue new frames before the old
-                                    # ones are gone. ─────────────────────────
-                                    async def _clear_q() -> int:
-                                        cleared = 0
-                                        while True:
+                                    q_size = frame_q.qsize()
+                                    print(f"[GPU] Transition from silence to speech. Clearing frame_q of size {q_size}", flush=True)
+                                    def _clear():
+                                        while not frame_q.empty():
                                             try:
                                                 frame_q.get_nowait()
-                                                cleared += 1
                                             except asyncio.QueueEmpty:
                                                 break
-                                        return cleared
-
-                                    _clear_fut = asyncio.run_coroutine_threadsafe(
-                                        _clear_q(), event_loop
-                                    )
-                                    try:
-                                        _cleared = _clear_fut.result(timeout=2.0)
-                                        print(
-                                            f"[GPU] frame_q cleared "
-                                            f"{_cleared} frames",
-                                            flush=True,
-                                        )
-                                    except Exception as _ce:
-                                        print(
-                                            f"[GPU] frame_q clear error: {_ce!r}",
-                                            flush=True,
-                                        )
-                                    fm_engine.abs_frame = max(
-                                        0, fm_engine.abs_frame - q_size_before_clear
-                                    )
-                                    # ─────────────────────────────────────────
+                                    event_loop.call_soon_threadsafe(_clear)
+                                    fm_engine.abs_frame = max(0, fm_engine.abs_frame - q_size)
                                     was_silent = False
                             else:
                                 was_silent = True
@@ -1909,15 +1811,22 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             helium_chunk = torch.cat(used_hidden, dim=0)
                             pcm_chunk = np.concatenate(used_audio, axis=0).astype(np.float32, copy=False)
                             target_frames = max(1, int(round(len(pcm_chunk) * float(args.fps) / TARGET_SR)))
-                            motion, fm_info = fm_engine._sample_motion_from_helium(helium_chunk, target_frames)
-                            used_codes = [
-                                s["reply_codes"].to(dtype=torch.int16).contiguous()
-                                for s in used_steps
-                                if isinstance(s.get("reply_codes"), torch.Tensor)
-                            ]
-                            if used_codes:
-                                fm_engine._session_live_token_parts.extend(used_codes)
-                            fm_engine._record_session_chunk(pcm_chunk, motion, fm_info)
+                            if was_silent:
+                                # Skip FM during silence — face stays still on the neutral frame
+                                _emitted_s = fm_engine.abs_frame
+                                fm_engine.abs_frame += target_frames
+                                fm_info = {"helium_ms": 0.0, "fm_ms": 0.0, "abs_start": _emitted_s}
+                                motion = None
+                            else:
+                                motion, fm_info = fm_engine._sample_motion_from_helium(helium_chunk, target_frames)
+                                used_codes = [
+                                    s["reply_codes"].to(dtype=torch.int16).contiguous()
+                                    for s in used_steps
+                                    if isinstance(s.get("reply_codes"), torch.Tensor)
+                                ]
+                                if used_codes:
+                                    fm_engine._session_live_token_parts.extend(used_codes)
+                                fm_engine._record_session_chunk(pcm_chunk, motion, fm_info)
                         else:
                             result = fm_engine.feed_pcm_f32(reply_pcm)
                             if result is None:
@@ -1942,7 +1851,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
 
                         avatar_chunk_id = len(fm_engine._session_chunk_rows)
                         frame_audio = split_audio_into_frame_slices(pcm_chunk, args.fps)
-                        n_frames = int(motion.shape[0])
+                        n_frames = target_frames if motion is None else int(motion.shape[0])
                         emitted = int(fm_info["abs_start"])
                         text_payload = ev.get("audio_text") or ev.get("sampled_text") or ""
                         total_gen_ms = (
@@ -1951,22 +1860,29 @@ def build_app(args: argparse.Namespace) -> FastAPI:
 
                         t_chunk_start = time.perf_counter()
 
-                        for sb_start in range(0, n_frames, fm_engine.render_sub_batch):
-                            sb_end = min(sb_start + fm_engine.render_sub_batch, n_frames)
-                            sub_motion = motion[sb_start:sb_end]
-                            sub_audio = frame_audio[sb_start:sb_end]
-
-                            packets = fm_engine.render_and_encode_subbatch(
-                                sub_motion,
-                                sub_audio,
-                                abs_start=emitted + sb_start,
-                                text_payload=text_payload,
-                                avatar_chunk_id=avatar_chunk_id,
-                                total_gen_ms=total_gen_ms,
-                            )
-
-                            for pkt in packets:
+                        if motion is None:
+                            # Silence: send neutral frozen frame without running the renderer
+                            for pkt in fm_engine.render_silence_subbatch(
+                                n_frames, frame_audio, emitted, avatar_chunk_id, total_gen_ms,
+                            ):
                                 _enqueue_frame(pkt)
+                        else:
+                            for sb_start in range(0, n_frames, fm_engine.render_sub_batch):
+                                sb_end = min(sb_start + fm_engine.render_sub_batch, n_frames)
+                                sub_motion = motion[sb_start:sb_end]
+                                sub_audio = frame_audio[sb_start:sb_end]
+
+                                packets = fm_engine.render_and_encode_subbatch(
+                                    sub_motion,
+                                    sub_audio,
+                                    abs_start=emitted + sb_start,
+                                    text_payload=text_payload,
+                                    avatar_chunk_id=avatar_chunk_id,
+                                    total_gen_ms=total_gen_ms,
+                                )
+
+                                for pkt in packets:
+                                    _enqueue_frame(pkt)
 
                         chunk_wall_ms = _ms(t_chunk_start)
                         produce_latency_ms = _ms(t_recv)
@@ -2148,12 +2064,7 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         stream_task = asyncio.create_task(stream_from_file(ws, fm_engine))
                     if reply_engine is not None:
                         reply_engine.reset_session()
-                        # Do NOT set session_started here.  The GPU producer
-                        # thread is unblocked only when the first real binary
-                        # mic packet arrives (see binary-packet handler below).
-                        # Setting it from the JSON "start" message — which the
-                        # client sends before any audio flows — caused the
-                        # avatar to speak immediately into silence.
+                        session_started.set()
                     print(
                         "[liveTryHeliumFM] start → "
                         + ("streaming from file" if fm_engine.audio_pcm is not None else "live Moshi reply mode"),
