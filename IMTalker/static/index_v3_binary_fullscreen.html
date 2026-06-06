@@ -247,6 +247,7 @@
 
     let ws = null, mediaStream = null, audioCtx = null, scriptNode = null;
     let micSource = null, analyser = null, meterTimer = null;
+    let _startMsgSent = false; // guard: send {"type":"start"} only once per session
     let playbackCursor = 0, playbackStartTime = 0, serverSR = 24000, audioStarted = false;
     let frameStore = new Map(), frameLoopHandle = null, frameCounter = 0, frameT0 = 0, sessionT0 = 0;
     let lastRenderedFrame = -1, highestFrameReceived = -1;
@@ -552,8 +553,12 @@
       ws = new WebSocket(wsUrl());
       ws.binaryType = "arraybuffer";
       ws.onopen = () => {
-        setStatus("Connected. Starting...");
-        ws.send(JSON.stringify({ type: "start", sample_rate: audioCtx ? Math.round(audioCtx.sampleRate) : 48000 }));
+        // Do NOT send "start" here.  The server now waits for the first binary
+        // audio packet before unblocking the GPU producer thread.  Sending
+        // "start" before audio flows caused the avatar to animate into silence.
+        // The scriptNode.onaudioprocess handler below sends "start" alongside
+        // the very first audio chunk so the sample-rate is still communicated.
+        setStatus("Connected — waiting for mic...");
       };
       ws.onmessage = async (event) => {
         if (event.data instanceof ArrayBuffer) {
@@ -656,6 +661,14 @@
           const input = evt.inputBuffer.getChannelData(0);
           const pcm16 = new Int16Array(input.length);
           for (let i = 0; i < input.length; i++) { const s = Math.max(-1, Math.min(1, input[i])); pcm16[i] = s < 0 ? s * 32768 : s * 32767; }
+          // Send "start" JSON with the very first audio chunk so the server
+          // knows the browser sample-rate before any audio arrives.  This
+          // replaces the old ws.onopen approach that sent "start" before mic
+          // capture was even established, causing premature generation.
+          if (!_startMsgSent) {
+            ws.send(JSON.stringify({ type: "start", sample_rate: Math.round(audioCtx.sampleRate) }));
+            _startMsgSent = true;
+          }
           ws.send(pcm16.buffer);
         };
         await connectWs(); startMeter();
@@ -673,6 +686,7 @@
       if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
       if (audioCtx) { try { await audioCtx.close(); } catch {} audioCtx = null; }
       if (meterTimer) { clearInterval(meterTimer); meterTimer = null; }
+      _startMsgSent = false;
       playbackCursor = 0; playbackStartTime = 0; audioStarted = false; frameStore = new Map();
       frameCounter = 0; frameT0 = 0; sessionT0 = 0;
       lastRenderedFrame = -1; highestFrameReceived = -1;

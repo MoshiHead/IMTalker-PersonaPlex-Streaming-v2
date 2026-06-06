@@ -1505,6 +1505,19 @@ class LiveHeliumFMOptions(BaseOptions):
         parser.add_argument("--fp32", action="store_true")
         parser.add_argument("--tf32", action="store_true")
         parser.add_argument("--compile_renderer", action="store_true")
+        # VAD — voice activity detection
+        parser.add_argument(
+            "--vad_threshold", type=float, default=0.015,
+            help="Input audio RMS threshold for VAD (0.0–1.0). Below this = silence.",
+        )
+        parser.add_argument(
+            "--vad_holdoff_sec", type=float, default=0.5,
+            help="Seconds of sub-threshold input before VAD declares speech-end.",
+        )
+        parser.add_argument(
+            "--vad_onset_frames", type=int, default=2,
+            help="Consecutive above-threshold frames required to declare speech-onset.",
+        )
         return parser
 
 
@@ -1645,6 +1658,29 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                 last_real_audio_wall = time.perf_counter()
                 was_silent = True
 
+                # ── VAD state ────────────────────────────────────────────────
+                # user_has_spoken: latches True on first confirmed speech;
+                #   gates ALL avatar frame generation so the avatar never speaks
+                #   before the user does.
+                # is_user_speaking: live VAD state with onset/offset hysteresis.
+                vad_threshold = float(getattr(args, "vad_threshold", 0.015))
+                vad_holdoff_sec = float(getattr(args, "vad_holdoff_sec", 0.5))
+                vad_onset_frames = max(1, int(getattr(args, "vad_onset_frames", 2)))
+                vad_silence_offset_frames = max(
+                    3, int(round(vad_holdoff_sec * float(args.fps)))
+                )
+                user_has_spoken: bool = False
+                is_user_speaking: bool = False
+                _consec_speech: int = 0
+                _consec_silence: int = 0
+                print(
+                    f"[GPU][VAD] threshold={vad_threshold:.4f} "
+                    f"onset={vad_onset_frames}f "
+                    f"holdoff={vad_holdoff_sec:.2f}s ({vad_silence_offset_frames}f)",
+                    flush=True,
+                )
+                # ─────────────────────────────────────────────────────────────
+
                 def _enqueue_frame(pkt: dict) -> None:
                     """Block until frame_q accepts pkt (real backpressure). Must run from GPU thread."""
                     fut = asyncio.run_coroutine_threadsafe(frame_q.put(pkt), event_loop)
@@ -1677,10 +1713,62 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         if raw_bytes:
                             pcm_f32 = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
                             rms = float(np.sqrt(np.mean(pcm_f32 ** 2))) if pcm_f32.size else 0.0
-                            if rms > 0.003:
+
+                            # ── VAD onset/offset with hysteresis ────────────
+                            if rms > vad_threshold:
                                 last_real_audio_wall = time.perf_counter()
+                                _consec_speech += 1
+                                _consec_silence = 0
+                                if _consec_speech >= vad_onset_frames:
+                                    if not is_user_speaking:
+                                        is_user_speaking = True
+                                        print(
+                                            f"[GPU][VAD] speech onset rms={rms:.4f}",
+                                            flush=True,
+                                        )
+                                    if not user_has_spoken:
+                                        user_has_spoken = True
+                                        # Clean slate when user first speaks:
+                                        # trim any stale Moshi input to at most
+                                        # one frame so we don't burst-process a
+                                        # multi-second backlog.
+                                        buf = reply_engine.input_buffer
+                                        if buf.shape[0] > MIMI_FRAME_SIZE:
+                                            reply_engine.input_buffer = (
+                                                buf[-MIMI_FRAME_SIZE:].copy()
+                                            )
+                                        # Reset FM streaming state so the first
+                                        # avatar chunk starts from a clean motion
+                                        # history, not one seeded by silence.
+                                        fm_engine.stream_state = None
+                                        fm_engine.abs_frame = 0
+                                        fm_engine.helium_deque = None
+                                        fm_engine.helium_deque_filled = 0
+                                        print(
+                                            "[GPU][VAD] first user speech — "
+                                            "FM state reset, ready to generate",
+                                            flush=True,
+                                        )
+                            else:
+                                _consec_speech = 0
+                                _consec_silence += 1
+                                if (
+                                    is_user_speaking
+                                    and _consec_silence >= vad_silence_offset_frames
+                                ):
+                                    is_user_speaking = False
+                                    print(
+                                        f"[GPU][VAD] speech offset "
+                                        f"(silent {_consec_silence} frames)",
+                                        flush=True,
+                                    )
+                            # ────────────────────────────────────────────────
+
                             no_audio_for = time.perf_counter() - last_real_audio_wall
-                            if rms > 0.003 or no_audio_for < 0.25:
+                            # Feed audio to Moshi when it is above threshold OR
+                            # within the 250ms holdoff window so Moshi sees
+                            # continuous audio without micro-gaps.
+                            if rms > vad_threshold or no_audio_for < 0.25:
                                 reply_engine.append_browser_pcm(
                                     np.frombuffer(raw_bytes, dtype=np.int16), input_sr
                                 )
@@ -1696,6 +1784,15 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                     if not session_started.is_set():
                         time.sleep(0.003)
                         continue
+
+                    # ── VAD gate: don't generate avatar frames until the user
+                    # has actually spoken.  This prevents the avatar from
+                    # animating (or Moshi from "greeting" into silence) before
+                    # the user says anything. ──────────────────────────────────
+                    if not user_has_spoken:
+                        time.sleep(0.005)
+                        continue
+                    # ─────────────────────────────────────────────────────────
 
                     if reply_engine.input_buffer.shape[0] < MIMI_FRAME_SIZE:
                         q_depth = frame_q.qsize()
@@ -1749,26 +1846,62 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                             pending_reply_audio = pending_reply_audio[hidden_steps_per_chunk:]
                             pending_reply_steps = pending_reply_steps[hidden_steps_per_chunk:]
 
+                            # ── is_speech: require BOTH a non-trivial output
+                            # token AND audible output RMS.  The old condition
+                            # used OR which triggered on any warmup token even
+                            # when output was pure silence, causing premature
+                            # avatar animation. ─────────────────────────────
                             is_speech = False
                             for s in used_steps:
                                 t = s.get("token", -1)
-                                rms = s.get("reply_rms", 0.0)
-                                if (t not in (-1, 0, 3)) or rms > 0.005:
+                                out_rms = s.get("reply_rms", 0.0)
+                                if t not in (-1, 0, 3) and out_rms > 0.01:
                                     is_speech = True
                                     break
+                            # ────────────────────────────────────────────────
 
                             if is_speech:
                                 if was_silent:
-                                    q_size = frame_q.qsize()
-                                    print(f"[GPU] Transition from silence to speech. Clearing frame_q of size {q_size}", flush=True)
-                                    def _clear():
-                                        while not frame_q.empty():
+                                    q_size_before_clear = frame_q.qsize()
+                                    print(
+                                        f"[GPU] silence→speech: clearing "
+                                        f"{q_size_before_clear} stale frames",
+                                        flush=True,
+                                    )
+                                    # ── Fix race condition: block the GPU
+                                    # thread until the event-loop coroutine
+                                    # has actually drained the queue, so we
+                                    # don't enqueue new frames before the old
+                                    # ones are gone. ─────────────────────────
+                                    async def _clear_q() -> int:
+                                        cleared = 0
+                                        while True:
                                             try:
                                                 frame_q.get_nowait()
+                                                cleared += 1
                                             except asyncio.QueueEmpty:
                                                 break
-                                    event_loop.call_soon_threadsafe(_clear)
-                                    fm_engine.abs_frame = max(0, fm_engine.abs_frame - q_size)
+                                        return cleared
+
+                                    _clear_fut = asyncio.run_coroutine_threadsafe(
+                                        _clear_q(), event_loop
+                                    )
+                                    try:
+                                        _cleared = _clear_fut.result(timeout=2.0)
+                                        print(
+                                            f"[GPU] frame_q cleared "
+                                            f"{_cleared} frames",
+                                            flush=True,
+                                        )
+                                    except Exception as _ce:
+                                        print(
+                                            f"[GPU] frame_q clear error: {_ce!r}",
+                                            flush=True,
+                                        )
+                                    fm_engine.abs_frame = max(
+                                        0, fm_engine.abs_frame - q_size_before_clear
+                                    )
+                                    # ─────────────────────────────────────────
                                     was_silent = False
                             else:
                                 was_silent = True
@@ -2015,7 +2148,12 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         stream_task = asyncio.create_task(stream_from_file(ws, fm_engine))
                     if reply_engine is not None:
                         reply_engine.reset_session()
-                        session_started.set()
+                        # Do NOT set session_started here.  The GPU producer
+                        # thread is unblocked only when the first real binary
+                        # mic packet arrives (see binary-packet handler below).
+                        # Setting it from the JSON "start" message — which the
+                        # client sends before any audio flows — caused the
+                        # avatar to speak immediately into silence.
                     print(
                         "[liveTryHeliumFM] start → "
                         + ("streaming from file" if fm_engine.audio_pcm is not None else "live Moshi reply mode"),
